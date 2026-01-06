@@ -1,4 +1,34 @@
+
+
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Databases
+*.db
+
+# ML / Caches
+.cache/
+huggingface/
 
 # dependencies
 /node_modules

@@ -10,8 +10,10 @@ from datetime import datetime
 import os
 from uuid import uuid4
 import socket
-import asyncio
 from pathlib import Path
+import dataclasses
+
+main_event_loop = None
 
 # Load environment variables from .env file
 try:
@@ -37,7 +39,7 @@ from core.noise import NoiseEstimator
 from core.confidence import ConfidenceEstimator
 from core.router import Router
 from core.cloud_asr import CloudASR
-from core.caption_merger import CaptionMerger
+from core.caption_merger import CaptionMerger, Caption
 from core.database import Database
 
 logging.basicConfig(level=logging.INFO)
@@ -77,48 +79,39 @@ async def internet_checker_loop():
         await check_internet_availability()
         await asyncio.sleep(10)  # Check every 10 seconds
 
+        
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown logic"""
-    global edge_asr, chunker, noise_estimator, confidence_estimator, router, cloud_asr, caption_merger, database
-    
-    # Startup
+    global edge_asr, chunker, noise_estimator, confidence_estimator
+    global router, cloud_asr, caption_merger, database, main_event_loop
+
     logger.info("Initializing LiveSpeak system...")
-    
+
+    # ✅ CAPTURE MAIN EVENT LOOP HERE
+    main_event_loop = asyncio.get_running_loop()
+    logger.info("Main event loop captured")
+
     edge_asr = EdgeASR(config)
     chunker = AudioChunker(config.audio.sample_rate, config.audio.chunk_duration_ms)
     noise_estimator = NoiseEstimator(config)
     confidence_estimator = ConfidenceEstimator(config)
     router = Router(config)
-    
-    # Load OpenAI API key from environment
+
     openai_api_key = os.getenv("OPENAI_API_KEY", None)
     cloud_asr = CloudASR(config, api_key=openai_api_key)
-    
+
     caption_merger = CaptionMerger(config)
     database = Database(db_path="livespeak.db")
-    
-    # Initial internet check
+
     await check_internet_availability()
-    
-    # Start internet availability checker (runs in background)
     internet_checker_task = asyncio.create_task(internet_checker_loop())
-    
-    logger.info("LiveSpeak system initialized successfully")
-    
+
     yield
-    
-    # Shutdown: cancel internet checker
+
     internet_checker_task.cancel()
-    try:
-        await internet_checker_task
-    except asyncio.CancelledError:
-        pass
-    
-    # Shutdown
-    logger.info("Shutting down LiveSpeak system...")
     if audio_capture:
         audio_capture.stop()
+
 
 app = FastAPI(
     title="LiveSpeak API",
@@ -226,16 +219,21 @@ async def process_audio_chunk(audio_chunk: np.ndarray):
     except Exception as e:
         logger.error(f"Error processing audio chunk: {e}")
 
+
 def audio_callback(chunk: np.ndarray):
-    """Callback when audio chunk is captured"""
-    global is_capturing
-    if not is_capturing:
+    global is_capturing, main_event_loop
+
+    if not is_capturing or main_event_loop is None:
         return
-    
-    # Add to chunker and process complete chunks
+
     chunks = chunker.add_audio(chunk)
     for audio_chunk in chunks:
-        asyncio.create_task(process_audio_chunk(audio_chunk))
+        main_event_loop.call_soon_threadsafe(
+            asyncio.create_task,
+            process_audio_chunk(audio_chunk)
+        )
+
+
 
 @app.get("/health")
 async def health_check():
@@ -366,6 +364,7 @@ async def get_jargon_corrections(limit: int = 50):
         return []
     
     return database.get_jargon_corrections(limit=limit)
+
 
 @app.websocket("/ws/captions")
 async def websocket_captions(websocket: WebSocket):

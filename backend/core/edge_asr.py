@@ -27,8 +27,43 @@ class EdgeASR:
             self.model = WhisperModel(
                 self.config.edge_asr.model_size,
                 device=self.config.edge_asr.device,
-                compute_type=self.config.edge_asr.compute_type,
-                language=self.config.edge_asr.language
+                compute_type=self.config.edge_asr.compute_type
+            )
+            logger.info("Edge ASR model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load Edge ASR model: {e}")
+            raise
+    
+"""
+Edge ASR Module - Faster-Whisper Base Model
+Offline, CPU-compatible ASR for real-time transcription
+"""
+import numpy as np
+from faster_whisper import WhisperModel
+import logging
+from typing import Tuple, List
+
+logger = logging.getLogger(__name__)
+
+class EdgeASR:
+    """
+    Edge-based ASR using Faster-Whisper base model.
+    Optimized for low latency (~200ms) and offline operation.
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load Faster-Whisper base model (offline, CPU-compatible)"""
+        logger.info(f"Loading Faster-Whisper {self.config.edge_asr.model_size} model...")
+        try:
+            self.model = WhisperModel(
+                self.config.edge_asr.model_size,
+                device=self.config.edge_asr.device,
+                compute_type=self.config.edge_asr.compute_type
             )
             logger.info("Edge ASR model loaded successfully")
         except Exception as e:
@@ -58,7 +93,7 @@ class EdgeASR:
                 temperature=0.0,
                 vad_filter=True,
                 vad_parameters=dict(threshold=0.5),
-                word_level=True
+                word_timestamps=True  
             )
             
             text = ""
