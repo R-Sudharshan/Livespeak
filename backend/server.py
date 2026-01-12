@@ -61,6 +61,9 @@ active_connections: Set[WebSocket] = set()
 is_capturing = False
 internet_available = True
 current_session_id = None
+# Thread pool for CPU-intensive tasks
+import concurrent.futures
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
 async def check_internet_availability():
     """Check if internet connection is available (non-blocking)"""
@@ -108,9 +111,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    yield
+
     internet_checker_task.cancel()
     if audio_capture:
         audio_capture.stop()
+    
+    # Shutdown executor
+    executor.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -128,7 +136,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 async def broadcast_caption(caption):
     """Broadcast caption to all connected WebSocket clients"""
     message = {
@@ -141,25 +148,33 @@ async def broadcast_caption(caption):
             "timestamp": caption.timestamp.isoformat()
         }
     }
-    
+
     if database and current_session_id:
         await database.save_caption_async(current_session_id, caption)
-    
-    # Broadcast to all connected clients
+
+    # Broadcast to all connected clients with proper error handling
     disconnected = set()
     for connection in list(active_connections):
         try:
             await connection.send_json(message)
-        except Exception as e:
-            logger.error(f"Broadcast error: {e}")
+        except WebSocketDisconnect:
+            logger.debug("WebSocket disconnected during broadcast")
             disconnected.add(connection)
-    
-    # Remove disconnected clients
-    for connection in disconnected:
-        active_connections.discard(connection)
+        except Exception as e:
+            logger.error(f"Broadcast error to client: {e}")
+            disconnected.add(connection)
 
-async def process_audio_chunk(audio_chunk: np.ndarray):
-    """Process a single audio chunk through the entire pipeline"""
+    # Remove disconnected clients
+    if disconnected:
+        for connection in disconnected:
+            active_connections.discard(connection)
+        logger.debug(f"Cleaned up {len(disconnected)} disconnected clients")
+        
+def run_blocking_pipeline(audio_chunk: np.ndarray, internet_avail: bool):
+    """
+    Run the CPU-intensive blocking parts of the pipeline in a separate thread.
+    Returns the intermediate results needed for the async parts.
+    """
     try:
         # Step 1: Edge ASR transcription
         edge_text, edge_raw_confidence, token_logprobs = edge_asr.transcribe(audio_chunk)
@@ -167,20 +182,56 @@ async def process_audio_chunk(audio_chunk: np.ndarray):
         # Step 2: Noise estimation (DSP-based, no ML)
         noise_score = noise_estimator.estimate_noise(audio_chunk)
         
-        # Step 3: Confidence estimation (uses token log-probabilities from Faster-Whisper)
+        # Step 3: Confidence estimation
         confidence = confidence_estimator.estimate_confidence(
             edge_text, token_logprobs, edge_raw_confidence, noise_score
         )
         
         # Step 4: Intelligent routing decision
         routing_decision = router.decide_routing(
-            confidence, noise_score, internet_available
+            confidence, noise_score, internet_avail
         )
+        
+        return {
+            "edge_text": edge_text,
+            "edge_raw_confidence": edge_raw_confidence,
+            "noise_score": noise_score,
+            "confidence": confidence,
+            "routing_decision": routing_decision
+        }
+    except Exception as e:
+        logger.error(f"Error in blocking pipeline: {e}")
+        raise
+
+async def process_audio_chunk(audio_chunk: np.ndarray):
+    """Process a single audio chunk through the entire pipeline"""
+    try:
+        # Run synchronous CPU-intensive tasks in thread pool
+        loop = asyncio.get_running_loop()
+        
+        # Copy array to ensure thread safety if needed (though read-only access is usually fine)
+        # But here we just pass it.
+        
+        try:
+            results = await loop.run_in_executor(
+                executor, 
+                run_blocking_pipeline, 
+                audio_chunk, 
+                internet_available
+            )
+        except Exception as e:
+            logger.error(f"Failed to run blocking pipeline: {e}")
+            return
+
+        edge_text = results["edge_text"]
+        edge_raw_confidence = results["edge_raw_confidence"]
+        noise_score = results["noise_score"]
+        routing_decision = results["routing_decision"]
         
         cloud_text = None
         cloud_confidence = None
         
-        # Step 5: Cloud ASR if needed (non-blocking)
+        # Step 5: Cloud ASR if needed (non-blocking, keeps running on main loop)
         if routing_decision["use_cloud"]:
             try:
                 # Pass numpy array directly (cloud_asr handles conversion)
@@ -365,57 +416,75 @@ async def get_jargon_corrections(limit: int = 50):
     
     return database.get_jargon_corrections(limit=limit)
 
-
 @app.websocket("/ws/captions")
 async def websocket_captions(websocket: WebSocket):
     """WebSocket endpoint for real-time caption streaming"""
     await websocket.accept()
     active_connections.add(websocket)
-    
+
     logger.info(f"Client connected. Total connections: {len(active_connections)}")
-    
+
     # Send initial system info
-    await websocket.send_json({
-        "type": "system_info",
-        "data": {
-            "sample_rate": config.audio.sample_rate,
-            "chunk_duration_ms": config.audio.chunk_duration_ms,
-            "edge_model": config.edge_asr.model_size,
-            "cloud_asr_enabled": config.routing.enable_cloud_asr
-        }
-    })
-    
+    try:
+        await websocket.send_json({
+            "type": "system_info",
+            "data": {
+                "sample_rate": config.audio.sample_rate,
+                "chunk_duration_ms": config.audio.chunk_duration_ms,
+                "edge_model": config.edge_asr.model_size,
+                "cloud_asr_enabled": config.routing.enable_cloud_asr
+            }
+        })
+    except WebSocketDisconnect:
+        logger.warning("Client disconnected immediately after connection")
+        active_connections.discard(websocket)
+        return
+
     try:
         while True:
-            # Keep connection alive and handle client commands
-            data = await websocket.receive_text()
-            
-            if data == "ping":
-                await websocket.send_json({"type": "pong"})
-            
-            elif data == "get_stats":
-                stats = router.get_stats() if router else {}
-                await websocket.send_json({
-                    "type": "stats",
-                    "data": stats
-                })
-            
-            elif data == "get_history":
-                if current_session_id and database:
-                    history = database.get_captions(current_session_id, limit=50)
-                    await websocket.send_json({
-                        "type": "history",
-                        "data": history
-                    })
-    
-    except WebSocketDisconnect:
-        active_connections.remove(websocket)
-        logger.info(f"Client disconnected. Total connections: {len(active_connections)}")
-    
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        active_connections.discard(websocket)
+            try:
+                # Keep connection alive and handle client commands
+                data = await websocket.receive_text()
 
+                if data == "ping":
+                    await websocket.send_json({"type": "pong"})
+
+                elif data == "get_stats":
+                    stats = router.get_stats() if router else {}
+                    await websocket.send_json({
+                        "type": "stats",
+                        "data": stats
+                    })
+
+                elif data == "get_history":
+                    if current_session_id and database:
+                        history = database.get_captions(current_session_id, limit=50)
+                        await websocket.send_json({
+                            "type": "history",
+                            "data": history
+                        })
+
+            except WebSocketDisconnect:
+                # Normal client disconnect
+                break
+                
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message: {e}")
+                # Continue to keep connection alive
+                continue
+
+    except WebSocketDisconnect:
+        # Client disconnected
+        pass
+        
+    except Exception as e:
+        logger.error(f"Unexpected WebSocket error: {e}")
+        
+    finally:
+        # Ensure connection is removed from active set
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+            logger.info(f"Client disconnected. Total connections: {len(active_connections)}")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
