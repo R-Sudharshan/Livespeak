@@ -1,12 +1,12 @@
-import { useState, useEffect, useRef } from "react"
+import { useEffect, useRef } from "react"
 import "./CaptionStream.css"
 
 /**
  * CaptionStream Component
- * 
+ *
  * Displays real-time captions with:
- * - Active Caption: Shows only the current, incomplete sentence being spoken.
- * - History: Shows finalized sentences.
+ * - Active Caption: current, incomplete sentence
+ * - History: finalized sentences
  */
 export default function CaptionStream({
   captions,
@@ -16,49 +16,51 @@ export default function CaptionStream({
   onStart,
   onStop,
 }) {
-  // We derive state from props
-  // The 'captions' prop contains all captions.
-  // We assume the last one is 'active' if it is NOT final, or if it is very recent.
-  // Actually, standard logic: 
-  // - If the last caption is partial -> It's the "Current Caption".
-  // - All previous valid captions -> History.
-
   const bottomRef = useRef(null)
 
-  // Filter captions
-  const history = captions.filter(c => c.is_final)
-  const active = captions.length > 0 && !captions[captions.length - 1].is_final
-    ? captions[captions.length - 1]
-    : null
+  // Separate active vs history
+  const history = captions.filter((c) => c.is_final)
+  const active =
+    captions.length > 0 && !captions[captions.length - 1].is_final
+      ? captions[captions.length - 1]
+      : null
 
   // Auto-scroll history
   useEffect(() => {
-    if (bottomRef.current) {
-      bottomRef.current.scrollIntoView({ behavior: "smooth" })
-    }
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [history.length])
 
+  // --------------------------------------------
+  // Helpers
+  // --------------------------------------------
   const getSourceColor = (source) => {
-    return source === "cloud" ? "#3b82f6" : "#10b981" // blue : green
+    if (source === "cloud") return "#3b82f6" // blue
+    return "#10b981" // green (local / window)
   }
 
-  const getSourceLabel = (source, confidence) => {
+  const getSourceLabel = (source, confidence = 1.0) => {
     if (source === "cloud") return "CLOUD"
-    if ((source === "local" || source === "edge") && confidence < 0.7) {
+    if ((source === "local" || source === "window") && confidence < 0.7) {
       return "LOCAL (low)"
     }
-    if (source === "local") return "LOCAL"
-    if (source === "window") return "LOCAL"
+    if (source === "local" || source === "window") return "LOCAL"
     return source.toUpperCase()
   }
 
+  // --------------------------------------------
+  // UI
+  // --------------------------------------------
   return (
     <div className="caption-stream">
-      {/* Control Panel */}
+      {/* ---------------- Controls ---------------- */}
       <div className="control-panel">
         <div className="control-header">
           <h2>Controls</h2>
-          <div className={`connection-status ${isConnected ? "connected" : "demo"}`}>
+          <div
+            className={`connection-status ${
+              isConnected ? "connected" : "demo"
+            }`}
+          >
             <span className="status-dot" />
             <span>{isConnected ? "Backend Connected" : "Demo Mode"}</span>
           </div>
@@ -72,6 +74,7 @@ export default function CaptionStream({
           >
             {isRunning ? "● Recording" : "▶ Start"}
           </button>
+
           <button
             className={`btn btn-stop ${!isRunning ? "disabled" : ""}`}
             onClick={onStop}
@@ -102,13 +105,13 @@ export default function CaptionStream({
             </li>
             <li>
               <span>Model:</span>
-              <strong>Sherpa-ONNX (Zipformer)</strong>
+              <strong>Faster-Whisper (Edge + Cloud)</strong>
             </li>
           </ul>
         </div>
       </div>
 
-      {/* Main Caption Display */}
+      {/* ---------------- Captions ---------------- */}
       <div className="caption-display">
         <div className="caption-header">
           <h2>Live Captions</h2>
@@ -117,7 +120,7 @@ export default function CaptionStream({
           </span>
         </div>
 
-        {/* ACTIVE CAPTION BOX (The box above) */}
+        {/* Active Caption */}
         <div className="caption-main">
           {isRunning ? (
             <div className="current-caption">
@@ -127,18 +130,22 @@ export default function CaptionStream({
                   <div className="active-meta">
                     <span
                       className="source-badge"
-                      style={{ backgroundColor: getSourceColor(active.source) }}
+                      style={{
+                        backgroundColor: getSourceColor(active.source),
+                      }}
                     >
                       {getSourceLabel(active.source, active.confidence)}
                     </span>
                   </div>
                 </>
               ) : (
-                <p className="caption-placeholder">Listening</p>
+                <p className="caption-placeholder">Listening…</p>
               )}
-              {/* Typing Indicator: Always show when running to give "alive" feel, or logic to show only if active */}
+
               <div className="typing-indicator">
-                <span>.</span><span>.</span><span>.</span>
+                <span>.</span>
+                <span>.</span>
+                <span>.</span>
               </div>
             </div>
           ) : (
@@ -148,54 +155,71 @@ export default function CaptionStream({
           )}
         </div>
 
-        {/* HISTORY BOX (The box below) */}
+        {/* History */}
         <div className="caption-history">
           <h3>Caption History</h3>
           <div className="history-list">
             {history.length === 0 && (
               <div className="history-empty">No captions yet</div>
             )}
+
             {history.map((caption, index) => (
               <div key={index} className="history-item">
                 <span className="history-text">{caption.text}</span>
                 <div className="history-meta">
                   <span
                     className="history-source"
-                    style={{ backgroundColor: getSourceColor(caption.source) }}
+                    style={{
+                      backgroundColor: getSourceColor(caption.source),
+                    }}
                   >
                     {getSourceLabel(caption.source, caption.confidence)}
                   </span>
                 </div>
               </div>
             ))}
+
             <div ref={bottomRef} />
           </div>
         </div>
       </div>
 
-      {/* Statistics Panel */}
+      {/* ---------------- Stats ---------------- */}
       <div className="stats-panel">
         <h2>Statistics</h2>
+
         {stats ? (
           <>
             <div className="stats-grid">
               <div className="stat-card">
                 <div className="stat-label">Total Chunks</div>
-                <div className="stat-value">{stats.total_chunks || 0}</div>
+                <div className="stat-value">
+                  {stats.total_chunks || 0}
+                </div>
               </div>
+
               <div className="stat-card">
                 <div className="stat-label">Edge Processing</div>
-                <div className="stat-value">{stats.edge_percentage?.toFixed(1) || 0}%</div>
+                <div className="stat-value">
+                  {stats.edge_percentage?.toFixed(1) || 0}%
+                </div>
               </div>
+
               <div className="stat-card">
                 <div className="stat-label">Cloud Routing</div>
-                <div className="stat-value">{stats.cloud_percentage?.toFixed(1) || 0}%</div>
+                <div className="stat-value">
+                  {stats.cloud_percentage?.toFixed(1) || 0}%
+                </div>
               </div>
+
               <div className="stat-card">
                 <div className="stat-label">Cloud Success</div>
-                <div className="stat-value">{stats.cloud_success_rate?.toFixed(1) || 0}%</div>
+                <div className="stat-value">
+                  {stats.cloud_success_rate?.toFixed(1) || 0}%
+                </div>
               </div>
             </div>
+
             <div className="stats-details">
               <div className="detail-row">
                 <span>Edge Only:</span>

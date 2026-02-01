@@ -5,34 +5,42 @@ import numpy as np
 import os
 import math
 import tempfile
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import scipy.io.wavfile as wavfile
+
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load environment variables
+# ----------------------------------------------------
+# ENV
+# ----------------------------------------------------
 # Look in current dir, then one level up
 if not load_dotenv():
-    load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-# --- CONFIG ---
+# ----------------------------------------------------
+# CONFIG
+# ----------------------------------------------------
 SAMPLE_RATE = 16000
 WINDOW_SECONDS = 2.5
 STRIDE_SECONDS = 0.5
 MODEL_SIZE = "small.en"
 BEAM_SIZE = 5
-CLOUD_CONFIDENCE_THRESHOLD = 0.7  # Fallback to cloud if confidence is below this
+CLOUD_CONFIDENCE_THRESHOLD = 0.7
 
-# --- GLOBAL STATE ---
+# ----------------------------------------------------
+# GLOBAL STATE
+# ----------------------------------------------------
 model = None
 openai_client = None
 is_running = False
 debug_wav_saved = False
 
-# Statistics Tracking
+# Statistics
 stats = {
     "total_chunks": 0,
     "edge_only": 0,
@@ -40,33 +48,46 @@ stats = {
     "cloud_succeeded": 0,
     "edge_percentage": 100.0,
     "cloud_percentage": 0.0,
-    "cloud_success_rate": 0.0
+    "cloud_success_rate": 0.0,
 }
 
+# ----------------------------------------------------
+# STATS HELPERS
+# ----------------------------------------------------
 def update_stats(source, succeeded=True):
-    global stats
     stats["total_chunks"] += 1
+
     if source == "LOCAL":
         stats["edge_only"] += 1
     elif source == "CLOUD":
         stats["routed_to_cloud"] += 1
         if succeeded:
             stats["cloud_succeeded"] += 1
-    
-    # Calculate percentages
+
     total = stats["total_chunks"]
     if total > 0:
         stats["edge_percentage"] = (stats["edge_only"] / total) * 100
         stats["cloud_percentage"] = (stats["routed_to_cloud"] / total) * 100
-        
-    if stats["routed_to_cloud"] > 0:
-        stats["cloud_success_rate"] = (stats["cloud_succeeded"] / stats["routed_to_cloud"]) * 100
 
+    if stats["routed_to_cloud"] > 0:
+        stats["cloud_success_rate"] = (
+            stats["cloud_succeeded"] / stats["routed_to_cloud"]
+        ) * 100
+
+
+# ----------------------------------------------------
+# MODEL LOADING
+# ----------------------------------------------------
 def load_model():
     global model, openai_client
+
     print(f"[BACKEND] Loading Faster-Whisper ({MODEL_SIZE})...")
     try:
-        model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        model = WhisperModel(
+            MODEL_SIZE,
+            device="cpu",
+            compute_type="int8"
+        )
         print("[BACKEND] Local model loaded.")
     except Exception as e:
         print(f"[BACKEND] Error loading local model: {e}")
@@ -81,13 +102,16 @@ def load_model():
     else:
         print("[BACKEND] WARNING: OPENAI_API_KEY not found. Cloud fallback disabled.")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     threading.Thread(target=load_model, daemon=True).start()
     yield
-    # Shutdown logic (if needed) can go here
 
+
+# ----------------------------------------------------
+# FASTAPI APP
+# ----------------------------------------------------
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
@@ -98,13 +122,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------------------------------
+# CONTROL ENDPOINTS
+# ----------------------------------------------------
 @app.post("/capture/start")
 async def start_capture():
     global is_running, debug_wav_saved
     is_running = True
-    debug_wav_saved = False # Reset debug save
+    debug_wav_saved = False
     print("[BACKEND] Capture started")
     return {"status": "started"}
+
 
 @app.post("/capture/stop")
 async def stop_capture():
@@ -113,245 +141,201 @@ async def stop_capture():
     print("[BACKEND] Capture stopped")
     return {"status": "stopped"}
 
-# Synchronization primitives
-buffer_lock = asyncio.Lock()
 
-
-
-
+# ----------------------------------------------------
+# TRANSCRIPTION HELPERS
+# ----------------------------------------------------
 def transcribe_sync(audio_data):
-    if model is None: return "", 0.0
-    
-    # Step 3, 4, 6: Strict Settings
-    segments, _ = model.transcribe(
-        audio_data, 
-        beam_size=BEAM_SIZE,
-        language="en",          # Explicit Language
-        task="transcribe",      # Explicit Task
-        temperature=0.0,        # No random sampling
-        vad_filter=False,       # Disable VAD optimization
-        condition_on_previous_text=False, # Prevent cascading failures
-        word_timestamps=True    # Per requirements
-    )
-    
-    text_segments = list(segments)
-    text = " ".join([s.text for s in text_segments]).strip()
-    
-    # Calculate average confidence (logprob to prob)
-    if not text_segments:
+    if model is None:
         return "", 0.0
-    
-    avg_logprob = sum([s.avg_logprob for s in text_segments]) / len(text_segments)
+
+    segments, _ = model.transcribe(
+        audio_data,
+        beam_size=BEAM_SIZE,
+        language="en",
+        task="transcribe",
+        temperature=0.0,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        word_timestamps=True,
+    )
+
+    segments = list(segments)
+    if not segments:
+        return "", 0.0
+
+    text = " ".join(s.text for s in segments).strip()
+    avg_logprob = sum(s.avg_logprob for s in segments) / len(segments)
     confidence = math.exp(avg_logprob)
-    
+
     return text, confidence
+
 
 def transcribe_cloud(audio_data):
     if openai_client is None:
         return "", 0.0
-    
+
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
-            # Convert numpy array back to int16 for wav file
             audio_int16 = (audio_data * 32768.0).astype(np.int16)
             wavfile.write(temp_wav.name, SAMPLE_RATE, audio_int16)
-            
+
             with open(temp_wav.name, "rb") as audio_file:
                 transcript = openai_client.audio.transcriptions.create(
-                    model="whisper-1", 
+                    model="whisper-1",
                     file=audio_file,
-                    response_format="json"
+                    response_format="json",
                 )
-                # OpenAI doesn't return confidence in simple JSON format easily, 
-                # but we treat cloud as high confidence (1.0)
-                return transcript.get("text", "").strip(), 1.0
+
+        return transcript.get("text", "").strip(), 1.0
+
     except Exception as e:
         print(f"[CLOUD] Transcription error: {e}")
         return "", 0.0
 
+
+# ----------------------------------------------------
+# WEBSOCKET
+# ----------------------------------------------------
 @app.websocket("/ws/captions")
 async def websocket_endpoint(websocket: WebSocket):
-    global debug_wav_saved
     await websocket.accept()
     print("[BACKEND] WebSocket connected")
 
-    # Shared State for this connection
-    # Pre-allocate buffer for ~10 seconds
     buffer_capacity = int(SAMPLE_RATE * 10)
     audio_buffer = np.zeros(buffer_capacity, dtype=np.float32)
-    
-    # Mutual state container
+
     state = {
         "buffer_ptr": 0,
-        "total_samples": 0
+        "total_samples": 0,
     }
-    
+
     stop_event = asyncio.Event()
-    buffer_lock = asyncio.Lock() # Local lock for this connection's buffer
+    buffer_lock = asyncio.Lock()
 
     async def run_transcriber():
         last_transcribe_time = time.time()
-        # Track the last valid text to "commit" it when silence occurs
         last_committed_text = ""
-        last_interim_text = "" 
-        
+        last_interim_text = ""
+
         print("[TRANSCRIPTION] Task started")
-        
+
         while not stop_event.is_set():
-            try:
-                now = time.time()
-                if now - last_transcribe_time < STRIDE_SECONDS:
-                    await asyncio.sleep(0.05) # Check frequently for stop
-                    continue
-                
-                if model is None:
-                    await asyncio.sleep(0.5)
-                    continue
+            now = time.time()
+            if now - last_transcribe_time < STRIDE_SECONDS:
+                await asyncio.sleep(0.05)
+                continue
 
-                last_transcribe_time = now
+            if model is None:
+                await asyncio.sleep(0.5)
+                continue
 
-                # 1. Snapshot Audio (Critical Section)
-                segment_to_process = None
-                
-                async with buffer_lock:
-                    ptr = state["buffer_ptr"]
-                    
-                    # Logic needs to match previous: Pull last WINDOW_SECONDS
-                    window_samples_count = int(WINDOW_SECONDS * SAMPLE_RATE)
-                    
-                    if ptr >= window_samples_count:
-                         # Simple case: we have enough contiguous data at the end
-                         segment_to_process = audio_buffer[ptr - window_samples_count : ptr].copy()
-                    else:
-                        # Not enough data yet 
-                        # Wait for at least 1.0s
-                        if ptr < SAMPLE_RATE * 1.0:
-                            continue
-                        segment_to_process = audio_buffer[:ptr].copy()
+            last_transcribe_time = now
 
-                if segment_to_process is None:
+            async with buffer_lock:
+                ptr = state["buffer_ptr"]
+                window_samples = int(WINDOW_SECONDS * SAMPLE_RATE)
+
+                if ptr < SAMPLE_RATE:
                     continue
 
-                # 2. Silence Detection & Finalization Logic
-                max_amp = np.max(np.abs(segment_to_process))
-                
-                # If SILENCE detected
-                if max_amp < 0.01:
-                    # If we had some text pending that hasn't been committed yet, commit it now.
-                    if last_interim_text and last_interim_text != last_committed_text:
-                        print(f"[TRANSCRIPTION] Silence detected. Committing: '{last_interim_text}'")
-                        if not stop_event.is_set():
-                            await websocket.send_json({
-                                "type": "segment_final",
-                                "text": last_interim_text,
-                                "timestamp": now
-                            })
-                        last_committed_text = last_interim_text
-                        last_interim_text = "" # Reset interim
-                        
-                    continue # Skip transcription on silence
-
-                # 3. Transcription with Cloud Fallback
-                loop = asyncio.get_running_loop()
-                
-                # First attempt: Local
-                text, confidence = await loop.run_in_executor(None, transcribe_sync, segment_to_process)
-                source = "LOCAL"
-                
-                # Cloud Fallback Check
-                cloud_triggered = False
-                if text and confidence < CLOUD_CONFIDENCE_THRESHOLD and openai_client:
-                    print(f"[TRANSCRIPTION] Low confidence ({confidence:.2f}). Falling back to CLOUD...")
-                    cloud_triggered = True
-                    cloud_text, cloud_conf = await loop.run_in_executor(None, transcribe_cloud, segment_to_process)
-                    if cloud_text:
-                        text = cloud_text
-                        confidence = cloud_conf
-                        source = "CLOUD"
-                        print(f"[TRANSCRIPTION] Cloud recovery successful: '{text}'")
-                        update_stats("CLOUD", succeeded=True)
-                    else:
-                        update_stats("CLOUD", succeeded=False)
+                if ptr >= window_samples:
+                    segment = audio_buffer[ptr - window_samples : ptr].copy()
                 else:
-                    update_stats("LOCAL")
+                    segment = audio_buffer[:ptr].copy()
 
-                # Update partial tracking
-                if text:
-                    last_interim_text = text
-                
-                # 4. Send Result (Partial Update)
-                if not stop_event.is_set():
-                    try:
-                        await websocket.send_json({
-                            "type": "window_update",
-                            "text": text,
-                            "confidence": confidence,
-                            "source": source,
-                            "timestamp": now
-                        })
-                        # Periodically send stats or send with every update?
-                        # Let's send stats with every update for real-time feel
-                        await websocket.send_json({
-                            "type": "stats",
-                            "data": stats
-                        })
-                    except Exception as e:
-                        print(f"[TRANSCRIPTION] Send failed (stopping): {e}")
-                        stop_event.set()
-                        break
-            
-            except Exception as e:
-                print(f"[TRANSCRIPTION] Error: {e}")
-                await asyncio.sleep(1)
+            max_amp = np.max(np.abs(segment))
+            if max_amp < 0.01:
+                if last_interim_text and last_interim_text != last_committed_text:
+                    await websocket.send_json({
+                        "type": "segment_final",
+                        "text": last_interim_text,
+                        "timestamp": now,
+                    })
+                    last_committed_text = last_interim_text
+                    last_interim_text = ""
+                continue
+
+            loop = asyncio.get_running_loop()
+            text, confidence = await loop.run_in_executor(
+                None, transcribe_sync, segment
+            )
+
+            source = "LOCAL"
+
+            if text and confidence < CLOUD_CONFIDENCE_THRESHOLD and openai_client:
+                cloud_text, cloud_conf = await loop.run_in_executor(
+                    None, transcribe_cloud, segment
+                )
+                if cloud_text:
+                    text = cloud_text
+                    confidence = cloud_conf
+                    source = "CLOUD"
+                    update_stats("CLOUD", True)
+                else:
+                    update_stats("CLOUD", False)
+            else:
+                update_stats("LOCAL")
+
+            if text:
+                last_interim_text = text
+
+            await websocket.send_json({
+                "type": "window_update",
+                "text": text,
+                "confidence": confidence,
+                "source": source,
+                "timestamp": now,
+            })
+
+            await websocket.send_json({
+                "type": "stats",
+                "data": stats,
+            })
 
         print("[TRANSCRIPTION] Task finished")
 
-    # Start Transcriber
     transcriber_task = asyncio.create_task(run_transcriber())
 
     try:
         while True:
             message = await websocket.receive()
-            
+
             if message["type"] == "websocket.disconnect":
-                print("[RECEIVER] Disconnect received")
                 break
-            
+
             if "bytes" in message and is_running:
-                chunk_bytes = message["bytes"]
-                # Convert
-                chunk_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                chunk_len = len(chunk_np)
-                
+                chunk = (
+                    np.frombuffer(message["bytes"], dtype=np.int16)
+                    .astype(np.float32)
+                    / 32768.0
+                )
+
                 async with buffer_lock:
                     ptr = state["buffer_ptr"]
-                    
-                    # Overflow check (Shift Buffer Strategy)
-                    if ptr + chunk_len > buffer_capacity:
-                        # Keep last 5 seconds (2x Window)
-                        keep_samples = int(WINDOW_SECONDS * 2 * SAMPLE_RATE)
-                        if keep_samples > ptr: keep_samples = ptr
-                        
-                        # Shift
-                        audio_buffer[:keep_samples] = audio_buffer[ptr - keep_samples : ptr]
-                        state["buffer_ptr"] = keep_samples
-                        ptr = keep_samples # Update local var for next line use
-                    
-                    # Write
-                    audio_buffer[ptr : ptr + chunk_len] = chunk_np
-                    state["buffer_ptr"] += chunk_len
-                    state["total_samples"] += chunk_len
-                    
-    except WebSocketDisconnect:
-        print("[RECEIVER] WebSocketDisconnect exception")
-    except Exception as e:
-        print(f"[RECEIVER] Error: {e}")
-    finally:
-        print("[BACKEND] WebSocket cleaning up...")
-        stop_event.set() # Signal transcriber to stop
-        await transcriber_task # Wait for it to exit
-        print("[BACKEND] WebSocket closed completely")
+                    if ptr + len(chunk) > buffer_capacity:
+                        keep = int(WINDOW_SECONDS * 2 * SAMPLE_RATE)
+                        keep = min(keep, ptr)
+                        audio_buffer[:keep] = audio_buffer[ptr - keep : ptr]
+                        state["buffer_ptr"] = keep
+                        ptr = keep
 
+                    audio_buffer[ptr : ptr + len(chunk)] = chunk
+                    state["buffer_ptr"] += len(chunk)
+                    state["total_samples"] += len(chunk)
+
+    except WebSocketDisconnect:
+        print("[RECEIVER] WebSocket disconnected")
+    finally:
+        stop_event.set()
+        await transcriber_task
+        print("[BACKEND] WebSocket closed")
+
+
+# ----------------------------------------------------
+# ENTRYPOINT
+# ----------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -6,7 +6,7 @@ import "./App.css"
 
 /**
  * Main App Component
- * 
+ *
  * LiveSpeak - Real-time hybrid Edge + Cloud AI captioning system
  */
 export default function App() {
@@ -20,136 +20,95 @@ export default function App() {
   const [audioCapture, setAudioCapture] = useState(null)
   const mockIntervalRef = useRef(null)
 
-  // Initialize WebSocket connection
+  // --------------------------------------------------
+  // WebSocket Init
+  // --------------------------------------------------
   useEffect(() => {
-    // WebSocket URL - connect to FastAPI backend
-    const wsUrl = import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws/captions"
+    const wsUrl =
+      import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws/captions"
 
     const client = new WebSocketClient(wsUrl, {
       onConnect: () => {
-        console.log("[LiveSpeak] WebSocket connected successfully")
+        console.log("[LiveSpeak] WebSocket connected")
         setIsConnected(true)
         setMockMode(false)
         setError(null)
-        // Request initial stats
-        client.send("get_stats")
       },
+
       onDisconnect: () => {
         console.log("[LiveSpeak] WebSocket disconnected")
         setIsConnected(false)
         setMockMode(true)
       },
+
       onMessage: (message) => {
-        if (message.type === "caption") {
-          // Handle Vosk partial vs final captions distinctly
+        // ----------------------------------------------
+        // FINALIZED SEGMENT (Silence detected)
+        // ----------------------------------------------
+        if (message.type === "segment_final") {
           setCaptions((prev) => {
-            const data = message.data
-            // Treat 'sherpa' same as 'vosk' for live updates
-            const isLive = data.source === "vosk" || data.source === "sherpa"
-            const isFinal = !!data.is_final
-
-            const newCaptions = [...prev]
-
-            if (isLive && !isFinal) {
-              // Live partial: update the most recent partial instead of appending endlessly
-              const lastIdx = newCaptions.length - 1
-              const last = newCaptions[lastIdx]
-
-              if (last && (last.source === "vosk" || last.source === "sherpa") && !last.is_final) {
-                newCaptions[lastIdx] = data
-              } else {
-                newCaptions.push(data)
-              }
-            } else {
-              // Final Vosk caption or other sources: append as a new finalized caption
-              newCaptions.push(data)
-            }
-
-            // Keep only last 100 captions
-            return newCaptions.slice(-100)
-          })
-        } else if (message.type === "segment_final") {
-          // Commit finalized segment from backend (silence detected)
-          setCaptions((prev) => {
-            const newCaptions = [...prev]
-
-            // Remove any "window" (grey) captions since we are finalizing
-            // This cleans up the partials so we don't have duplicates
-            const cleaned = newCaptions.filter(c => c.source !== "window")
+            const cleaned = prev.filter(
+              (c) => !(c.source === "window" && !c.is_final)
+            )
 
             cleaned.push({
               text: message.text,
               source: (message.source || "window").toLowerCase(),
-              confidence: message.confidence || 1.0,
-              is_final: true,   // Black text (History)
-              timestamp: message.timestamp
+              confidence: message.confidence ?? 1.0,
+              is_final: true,
+              timestamp: message.timestamp,
             })
 
             return cleaned.slice(-100)
           })
+        }
 
-        } else if (message.type === "window_update") {
-          // New logic for Windowed Whisper
+        // ----------------------------------------------
+        // LIVE WINDOW UPDATE (Sliding Whisper)
+        // ----------------------------------------------
+        else if (message.type === "window_update") {
           setCaptions((prev) => {
-            // We treat the "window" as a special 'live' caption that is constantly replaced
-            // until we decide to 'finalize' it. 
+            const next = [...prev]
+            const lastIdx = next.length - 1
+            const last = next[lastIdx]
 
-            const newCaptions = [...prev]
-
-            // Remove previous window partials to avoid duplication
-            // We want to REPLACE the live window, not append
-            const lastIdx = newCaptions.length - 1
-            const last = newCaptions[lastIdx]
-
-            const liveData = {
+            const liveCaption = {
               text: message.text,
               source: (message.source || "window").toLowerCase(),
               confidence: message.confidence,
-              is_final: false, // Grey
-              timestamp: message.timestamp
+              is_final: false,
+              timestamp: message.timestamp,
             }
 
             if (last && last.source === "window" && !last.is_final) {
-              newCaptions[lastIdx] = liveData
+              next[lastIdx] = liveCaption
             } else {
-              newCaptions.push(liveData)
-            }
-            return newCaptions
-          })
-        } else if (message.type === "correction") {
-          // Whisper correction: replace only the last finalized Vosk sentence,
-          // never overwrite live partials.
-          setCaptions((prev) => {
-            const newCaptions = [...prev]
-            const correction = message.data
-
-            for (let i = newCaptions.length - 1; i >= 0; i--) {
-              const c = newCaptions[i]
-              if ((c.source === "vosk" || c.source === "sherpa") && c.is_final) {
-                newCaptions[i] = {
-                  ...c,
-                  text: correction.text,
-                  source: correction.source || "whisper",
-                  is_final: true,
-                }
-                break
-              }
+              next.push(liveCaption)
             }
 
-            return newCaptions
+            return next.slice(-100)
           })
-        } else if (message.type === "stats") {
+        }
+
+        // ----------------------------------------------
+        // STATS
+        // ----------------------------------------------
+        else if (message.type === "stats") {
           setStats(message.data)
-        } else if (message.type === "system_info") {
-          console.log("[LiveSpeak] System info:", message.data)
-        } else if (message.type === "error") {
+        }
+
+        // ----------------------------------------------
+        // SYSTEM / ERROR
+        // ----------------------------------------------
+        else if (message.type === "error") {
           setError(message.message || "Unknown error")
         }
       },
-      onError: (error) => {
-        console.log("[LiveSpeak] WebSocket error - activating demo mode:", error)
-        setMockMode(true)
+
+      onError: (err) => {
+        console.error("[LiveSpeak] WebSocket error:", err)
         setIsConnected(false)
+        setMockMode(true)
       },
     })
 
@@ -163,37 +122,40 @@ export default function App() {
     }
   }, [])
 
-  // Mock mode caption generation (for demo/offline)
+  // --------------------------------------------------
+  // MOCK MODE (Demo / Offline)
+  // --------------------------------------------------
   useEffect(() => {
-    if (isRunning && mockMode) {
-      let captionIndex = 0
-      const mockCaptions = [
-        "Welcome to LiveSpeak real-time captioning system",
-        "This is a demonstration of edge AI processing",
-        "The system works fully offline using Faster-Whisper",
-        "All processing happens in real-time with low latency",
-      ]
+    if (!isRunning || !mockMode) return
 
-      mockIntervalRef.current = setInterval(() => {
-        const mockCaption = {
-          text: mockCaptions[captionIndex % mockCaptions.length],
-          source: Math.random() > 0.7 ? "cloud" : "edge",
+    let idx = 0
+    const samples = [
+      "Welcome to LiveSpeak real-time captioning",
+      "Hybrid Edge and Cloud AI architecture",
+      "Low-latency streaming transcription",
+      "Enterprise-grade production system",
+    ]
+
+    mockIntervalRef.current = setInterval(() => {
+      setCaptions((prev) => [
+        ...prev.slice(-100),
+        {
+          text: samples[idx % samples.length],
+          source: Math.random() > 0.7 ? "cloud" : "local",
           confidence: Math.random() * 0.3 + 0.7,
-          noise_score: Math.random() * 0.3,
+          is_final: true,
           timestamp: new Date().toISOString(),
-        }
-        setCaptions((prev) => [...prev.slice(-100), mockCaption])
-        captionIndex++
-      }, 2000)
+        },
+      ])
+      idx++
+    }, 2000)
 
-      return () => {
-        if (mockIntervalRef.current) {
-          clearInterval(mockIntervalRef.current)
-        }
-      }
-    }
+    return () => clearInterval(mockIntervalRef.current)
   }, [isRunning, mockMode])
 
+  // --------------------------------------------------
+  // CONTROLS
+  // --------------------------------------------------
   const handleStart = async () => {
     if (mockMode) {
       setIsRunning(true)
@@ -202,85 +164,72 @@ export default function App() {
     }
 
     try {
-      // 1. Start Audio Capture first to ensure permissions
-      const capture = await startAudioCapture((data) => {
-        if (wsClient && wsClient.isConnected()) {
-          wsClient.send(data)
+      const capture = await startAudioCapture((chunk) => {
+        if (wsClient?.isConnected()) {
+          wsClient.send(chunk)
         }
       })
 
       setAudioCapture(capture)
 
-      // 2. Notify Backend
-      const response = await fetch("http://localhost:8000/capture/start", {
+      const res = await fetch("http://localhost:8000/capture/start", {
         method: "POST",
       })
-      if (response.ok) {
-        setIsRunning(true)
-        setError(null)
-      } else {
-        const data = await response.json()
-        setError(data.detail || "Failed to start capture")
-        capture.stop()
-        setAudioCapture(null)
-      }
+
+      if (!res.ok) throw new Error("Backend rejected start")
+
+      setIsRunning(true)
+      setError(null)
     } catch (err) {
       console.error(err)
-      setError(`Failed to start: ${err.message}`)
+      setError(err.message)
       setMockMode(true)
     }
   }
 
   const handleStop = async () => {
-    // 1. Stop Audio
-    if (audioCapture) {
-      audioCapture.stop()
-      setAudioCapture(null)
-    }
+    audioCapture?.stop()
+    setAudioCapture(null)
 
     if (mockMode) {
       setIsRunning(false)
-      if (mockIntervalRef.current) {
-        clearInterval(mockIntervalRef.current)
-      }
       return
     }
 
-    // 2. Notify Backend
     try {
-      const response = await fetch("http://localhost:8000/capture/stop", {
-        method: "POST",
-      })
-      if (response.ok) {
-        setIsRunning(false)
-      } else {
-        const data = await response.json()
-        setError(data.detail || "Failed to stop capture")
-      }
+      await fetch("http://localhost:8000/capture/stop", { method: "POST" })
+      setIsRunning(false)
     } catch (err) {
-      setError(`Failed to stop: ${err.message}`)
+      setError(err.message)
     }
   }
 
+  // --------------------------------------------------
+  // UI
+  // --------------------------------------------------
   return (
     <div className="app">
       <header className="app-header">
         <div className="header-content">
           <div className="header-title">
             <div
-              className={`status-indicator ${isConnected ? "connected" : mockMode ? "demo" : "disconnected"}`}
+              className={`status-indicator ${
+                isConnected ? "connected" : mockMode ? "demo" : "disconnected"
+              }`}
             />
             <h1>LiveSpeak</h1>
           </div>
+
           <p className="header-subtitle">
             Production-Grade Real-Time Live Captioning System
           </p>
+
           <p className="header-status">
             {isConnected
               ? "✓ Connected to backend"
               : mockMode
-                ? "⊘ Demo mode (backend offline)"
-                : "⟳ Connecting..."}
+              ? "⊘ Demo mode (backend offline)"
+              : "⟳ Connecting..."}
           </p>
         </div>
       </header>
@@ -304,7 +253,8 @@ export default function App() {
 
       <footer className="app-footer">
         <p>
-          Hybrid Edge + Cloud AI Architecture | L&T Techgium Hackathon | Enterprise-Ready
+          Hybrid Edge + Cloud AI Architecture | L&T Techgium Hackathon |
+          Enterprise-Ready
         </p>
       </footer>
     </div>
