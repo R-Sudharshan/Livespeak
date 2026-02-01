@@ -3,11 +3,20 @@ import threading
 import time
 import numpy as np
 import os
+import math
+import tempfile
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import scipy.io.wavfile as wavfile
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+# Look in current dir, then one level up
+if not load_dotenv():
+    load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 # --- CONFIG ---
 SAMPLE_RATE = 16000
@@ -15,18 +24,62 @@ WINDOW_SECONDS = 2.5
 STRIDE_SECONDS = 0.5
 MODEL_SIZE = "small.en"
 BEAM_SIZE = 5
+CLOUD_CONFIDENCE_THRESHOLD = 0.7  # Fallback to cloud if confidence is below this
 
 # --- GLOBAL STATE ---
 model = None
+openai_client = None
 is_running = False
 debug_wav_saved = False
 
+# Statistics Tracking
+stats = {
+    "total_chunks": 0,
+    "edge_only": 0,
+    "routed_to_cloud": 0,
+    "cloud_succeeded": 0,
+    "edge_percentage": 100.0,
+    "cloud_percentage": 0.0,
+    "cloud_success_rate": 0.0
+}
+
+def update_stats(source, succeeded=True):
+    global stats
+    stats["total_chunks"] += 1
+    if source == "LOCAL":
+        stats["edge_only"] += 1
+    elif source == "CLOUD":
+        stats["routed_to_cloud"] += 1
+        if succeeded:
+            stats["cloud_succeeded"] += 1
+    
+    # Calculate percentages
+    total = stats["total_chunks"]
+    if total > 0:
+        stats["edge_percentage"] = (stats["edge_only"] / total) * 100
+        stats["cloud_percentage"] = (stats["routed_to_cloud"] / total) * 100
+        
+    if stats["routed_to_cloud"] > 0:
+        stats["cloud_success_rate"] = (stats["cloud_succeeded"] / stats["routed_to_cloud"]) * 100
+
 def load_model():
-    global model
+    global model, openai_client
     print(f"[BACKEND] Loading Faster-Whisper ({MODEL_SIZE})...")
-    # Step 6: Use exact settings
-    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-    print("[BACKEND] Model loaded.")
+    try:
+        model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        print("[BACKEND] Local model loaded.")
+    except Exception as e:
+        print(f"[BACKEND] Error loading local model: {e}")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        try:
+            openai_client = OpenAI(api_key=api_key)
+            print("[BACKEND] OpenAI client initialized.")
+        except Exception as e:
+            print(f"[BACKEND] Error initializing OpenAI client: {e}")
+    else:
+        print("[BACKEND] WARNING: OPENAI_API_KEY not found. Cloud fallback disabled.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,7 +120,7 @@ buffer_lock = asyncio.Lock()
 
 
 def transcribe_sync(audio_data):
-    if model is None: return ""
+    if model is None: return "", 0.0
     
     # Step 3, 4, 6: Strict Settings
     segments, _ = model.transcribe(
@@ -81,8 +134,40 @@ def transcribe_sync(audio_data):
         word_timestamps=True    # Per requirements
     )
     
-    text = " ".join([s.text for s in segments]).strip()
-    return text
+    text_segments = list(segments)
+    text = " ".join([s.text for s in text_segments]).strip()
+    
+    # Calculate average confidence (logprob to prob)
+    if not text_segments:
+        return "", 0.0
+    
+    avg_logprob = sum([s.avg_logprob for s in text_segments]) / len(text_segments)
+    confidence = math.exp(avg_logprob)
+    
+    return text, confidence
+
+def transcribe_cloud(audio_data):
+    if openai_client is None:
+        return "", 0.0
+    
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_wav:
+            # Convert numpy array back to int16 for wav file
+            audio_int16 = (audio_data * 32768.0).astype(np.int16)
+            wavfile.write(temp_wav.name, SAMPLE_RATE, audio_int16)
+            
+            with open(temp_wav.name, "rb") as audio_file:
+                transcript = openai_client.audio.transcriptions.create(
+                    model="whisper-1", 
+                    file=audio_file,
+                    response_format="json"
+                )
+                # OpenAI doesn't return confidence in simple JSON format easily, 
+                # but we treat cloud as high confidence (1.0)
+                return transcript.get("text", "").strip(), 1.0
+    except Exception as e:
+        print(f"[CLOUD] Transcription error: {e}")
+        return "", 0.0
 
 @app.websocket("/ws/captions")
 async def websocket_endpoint(websocket: WebSocket):
@@ -166,22 +251,49 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                     continue # Skip transcription on silence
 
-                # 3. CPU Bound Transcription (run in executor)
-                # If not silent, we transcribe
+                # 3. Transcription with Cloud Fallback
                 loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, transcribe_sync, segment_to_process)
                 
+                # First attempt: Local
+                text, confidence = await loop.run_in_executor(None, transcribe_sync, segment_to_process)
+                source = "LOCAL"
+                
+                # Cloud Fallback Check
+                cloud_triggered = False
+                if text and confidence < CLOUD_CONFIDENCE_THRESHOLD and openai_client:
+                    print(f"[TRANSCRIPTION] Low confidence ({confidence:.2f}). Falling back to CLOUD...")
+                    cloud_triggered = True
+                    cloud_text, cloud_conf = await loop.run_in_executor(None, transcribe_cloud, segment_to_process)
+                    if cloud_text:
+                        text = cloud_text
+                        confidence = cloud_conf
+                        source = "CLOUD"
+                        print(f"[TRANSCRIPTION] Cloud recovery successful: '{text}'")
+                        update_stats("CLOUD", succeeded=True)
+                    else:
+                        update_stats("CLOUD", succeeded=False)
+                else:
+                    update_stats("LOCAL")
+
                 # Update partial tracking
-                if result:
-                    last_interim_text = result
+                if text:
+                    last_interim_text = text
                 
                 # 4. Send Result (Partial Update)
                 if not stop_event.is_set():
                     try:
                         await websocket.send_json({
                             "type": "window_update",
-                            "text": result,
+                            "text": text,
+                            "confidence": confidence,
+                            "source": source,
                             "timestamp": now
+                        })
+                        # Periodically send stats or send with every update?
+                        # Let's send stats with every update for real-time feel
+                        await websocket.send_json({
+                            "type": "stats",
+                            "data": stats
                         })
                     except Exception as e:
                         print(f"[TRANSCRIPTION] Send failed (stopping): {e}")

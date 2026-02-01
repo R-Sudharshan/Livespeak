@@ -79,7 +79,8 @@ export default function App() {
 
             cleaned.push({
               text: message.text,
-              source: "window", // Keep source as window or change to 'finalized'
+              source: (message.source || "window").toLowerCase(),
+              confidence: message.confidence || 1.0,
               is_final: true,   // Black text (History)
               timestamp: message.timestamp
             })
@@ -102,7 +103,8 @@ export default function App() {
 
             const liveData = {
               text: message.text,
-              source: "window",
+              source: (message.source || "window").toLowerCase(),
+              confidence: message.confidence,
               is_final: false, // Grey
               timestamp: message.timestamp
             }

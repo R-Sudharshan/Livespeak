@@ -44,10 +44,12 @@ export default function CaptionStream({
 
   const getSourceLabel = (source, confidence) => {
     if (source === "cloud") return "CLOUD"
-    if (source === "edge" && confidence < 0.75) {
-      return "EDGE (low confidence)"
+    if ((source === "local" || source === "edge") && confidence < 0.7) {
+      return "LOCAL (low)"
     }
-    return "EDGE"
+    if (source === "local") return "LOCAL"
+    if (source === "window") return "LOCAL"
+    return source.toUpperCase()
   }
 
   return (
@@ -120,7 +122,17 @@ export default function CaptionStream({
           {isRunning ? (
             <div className="current-caption">
               {active ? (
-                <p className="caption-text">{active.text}</p>
+                <>
+                  <p className="caption-text">{active.text}</p>
+                  <div className="active-meta">
+                    <span
+                      className="source-badge"
+                      style={{ backgroundColor: getSourceColor(active.source) }}
+                    >
+                      {getSourceLabel(active.source, active.confidence)}
+                    </span>
+                  </div>
+                </>
               ) : (
                 <p className="caption-placeholder">Listening</p>
               )}
@@ -151,7 +163,7 @@ export default function CaptionStream({
                     className="history-source"
                     style={{ backgroundColor: getSourceColor(caption.source) }}
                   >
-                    {caption.source === "sherpa" ? "Live" : caption.source}
+                    {getSourceLabel(caption.source, caption.confidence)}
                   </span>
                 </div>
               </div>
